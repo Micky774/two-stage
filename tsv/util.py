@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+import numpy as np
 
 
 def spectral_norm(input_: torch.Tensor):
@@ -88,7 +89,7 @@ class ResidualConv(nn.Module):
     def forward(self, x):
         y = self.up_channel_conv(x)
         for conv in self.conv_modules:
-            y = F.relu(self.batch_norm(y))
+            y = F.leaky_relu(self.batch_norm(y))
             y = conv(y)
         return y + self.bypass(x)
 
@@ -157,3 +158,11 @@ class ScaleFCBlock(nn.Module):
         for block in self.blocks:
             y = block(y)
         return y
+
+
+def kaiming_init(model: nn.Module):
+    for name, param in model.named_parameters():
+        if name.endswith(".bias"):
+            param.data.fill_(0)
+        else:
+            param.data.normal_(0, 1 / np.sqrt(torch.numel(param)))
