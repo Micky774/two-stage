@@ -16,7 +16,6 @@ parser.add_argument("--fast-dev", type=bool, default=False)
 parser.add_argument("--n-epochs", type=int, default=100)
 parser.add_argument("--batch-size", type=int, default=200)
 args = parser.parse_args()
-print(args)
 
 
 class MNISTDataModule(L.LightningDataModule):

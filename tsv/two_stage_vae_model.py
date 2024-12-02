@@ -1,8 +1,9 @@
 import numpy as np
 import torch
+from torch.utils.module_tracker import ModuleTracker
+from torch import nn
 import torch.nn.functional as F
 import lightning as L
-from torch import nn
 from .util import ScaleBlock, Downsample, ScaleFCBlock
 from lightning.pytorch.utilities import grad_norm
 
@@ -183,11 +184,12 @@ class Resnet(TwoStageVaeModel):
         self.base_dim = base_dim
         self.fc_dim = fc_dim
         self.num_decoder_scales = num_decoder_scales
-
-        self.build_manifold_encoder()
-        self.build_manifold_decoder()
+        with ModuleTracker() as tracker:
+            self.build_manifold_encoder()
+            self.build_manifold_decoder()
+        _nan_hook = self.nan_hook(tracker)
         for submodule in self.modules():
-            submodule.register_forward_hook(self.nan_hook)
+            submodule.register_forward_hook(_nan_hook)
 
     def build_manifold_encoder(self):
         dim = self.base_dim
@@ -315,31 +317,32 @@ class Resnet(TwoStageVaeModel):
         )
 
     def configure_optimizers(self):
-        optim = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optim = torch.optim.Adagrad(self.parameters(), lr=1e-3)
         decay_sched = torch.optim.lr_scheduler.ExponentialLR(
-            optimizer=optim, gamma=0.985, verbose=True
+            optimizer=optim, gamma=0.985
         )
         cos_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer=optim, verbose=True, T_0=10, T_mult=2
+            optimizer=optim, T_0=10, T_mult=2
         )
         lr_sched = torch.optim.lr_scheduler.ChainedScheduler([cos_sched, decay_sched])
 
         return {"optimizer": optim, "lr_scheduler": lr_sched}
 
-    def nan_hook(self, module, args, output):
-        if not isinstance(output, tuple):
-            outputs = [output]
-        else:
-            outputs = output
+    def nan_hook(self, tracker: ModuleTracker):
+        def _nan_hook(module, args, output):
+            if not isinstance(output, tuple):
+                outputs = [output]
+            else:
+                outputs = output
 
-        for i, out in enumerate(outputs):
-            nan_mask = torch.isnan(out)
-            if nan_mask.any():
-                print("In", self.__class__.__name__)
-                raise RuntimeError(
-                    f"Found NAN in output {out=} at indices: ",
-                    nan_mask.nonzero(),
-                )
+            for i, out in enumerate(outputs):
+                nan_mask = torch.isnan(out)
+                if nan_mask.any():
+                    print("In", self.__class__.__name__)
+                    raise RuntimeError(f"Found NAN in output of {tracker.parents}")
+            return None
+
+        return _nan_hook
 
     def on_before_optimizer_step(self, optimizer: torch.optim.Optimizer):
         self.log_dict(
