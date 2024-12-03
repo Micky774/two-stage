@@ -61,7 +61,7 @@ class Downsample(nn.Module):
         )
 
     def forward(self, x):
-        return self.conv(x)
+        return F.leaky_relu(self.conv(x))
 
 
 class Upsample(nn.Module):
@@ -70,7 +70,7 @@ class Upsample(nn.Module):
         self.convT = nn.ConvTranspose2d(in_dim, out_dim, kernel_size, stride=2)
 
     def forward(self, x):
-        return self.convT(x)
+        return F.leaky_relu(self.convT(x))
 
 
 class ResidualConv(nn.Module):
@@ -88,10 +88,11 @@ class ResidualConv(nn.Module):
 
     def forward(self, x):
         y = self.up_channel_conv(x)
+        y = F.leaky_relu(y)
         for conv in self.conv_modules:
-            y = F.leaky_relu(self.batch_norm(y))
-            y = conv(y)
-        return y + self.bypass(x)
+            y = self.batch_norm(y)
+            y = F.leaky_relu(conv(y))
+        return y + F.leaky_relu(self.bypass(x))
 
 
 class ResidualFC(nn.Module):
@@ -108,7 +109,7 @@ class ResidualFC(nn.Module):
         for fc in self.fc_modules:
             y = F.leaky_relu(y)
             y = fc(y)
-        return y + self.bypass(x)
+        return F.leaky_relu(y + self.bypass(x))
 
 
 class ScaleBlock(nn.Module):
@@ -164,5 +165,10 @@ def kaiming_init(model: nn.Module):
     for name, param in model.named_parameters():
         if name.endswith(".bias"):
             param.data.fill_(0)
-        else:
-            param.data.normal_(0, 1 / np.sqrt(torch.numel(param)))
+        elif "log_gamma" in name:
+            pass
+        elif "Linear" in name:
+            param.data.normal_(0, np.sqrt(2 / torch.numel(param)))
+        elif "Conv" in name:
+            n = param.shape[1] * param[0, 0].numel()
+            param.data.normal_(0, np.sqrt(2 / n))

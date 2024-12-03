@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import lightning as L
 from .util import ScaleBlock, Downsample, ScaleFCBlock
 from lightning.pytorch.utilities import grad_norm
+from torch.utils.data import RandomSampler
 
 HALF_LOG_TWO_PI = 0.91893
 
@@ -67,9 +68,9 @@ class TwoStageVaeModel(L.LightningModule):
     def MSE_loss(self, x, x_hat, log_gamma):
         error = torch.square((x - x_hat) / torch.exp(log_gamma))
         error += 2 * log_gamma
-        # We instead take the mean across all elements to implicitly normalize
+        # We can instead take the mean across all elements to implicitly normalize
         # by the data dimensionality to ensure a well-conditioned loss scale
-        # error = error.sum([1, 2, 3])
+        error = error.sum([1, 2, 3])
         return error.mean()
 
     def KL_loss(self, mu, log_sd):
@@ -184,6 +185,8 @@ class Resnet(TwoStageVaeModel):
         self.base_dim = base_dim
         self.fc_dim = fc_dim
         self.num_decoder_scales = num_decoder_scales
+        self.sampler = None
+
         with ModuleTracker() as tracker:
             self.build_manifold_encoder()
             self.build_manifold_decoder()
@@ -280,7 +283,7 @@ class Resnet(TwoStageVaeModel):
         for block in self.decoder_scale_blocks:
             t = block(t)
         t = self.out_conv(t)
-        return F.sigmoid(t)
+        return t
 
     def forward(self, x):
         z, mu_z, logsd_z = self.apply_manifold_encoder(x)
@@ -304,7 +307,7 @@ class Resnet(TwoStageVaeModel):
 
     def on_train_epoch_end(self):
         tb = self.trainer.logger.experiment
-        sample_image = next(iter(self.trainer.train_dataloader))[0][0].unsqueeze(0)
+        sample_image = next(iter(self.trainer.train_dataloader))[0][0].unsqueeze(1)
         tb.add_image(
             f"Sample_{self.current_epoch}/ground_truth",
             sample_image.squeeze(0),
@@ -317,7 +320,7 @@ class Resnet(TwoStageVaeModel):
         )
 
     def configure_optimizers(self):
-        optim = torch.optim.Adagrad(self.parameters(), lr=1e-3)
+        optim = torch.optim.Adagrad(self.parameters(), lr=1e-2)
         decay_sched = torch.optim.lr_scheduler.ExponentialLR(
             optimizer=optim, gamma=0.985
         )
@@ -326,7 +329,7 @@ class Resnet(TwoStageVaeModel):
         )
         lr_sched = torch.optim.lr_scheduler.ChainedScheduler([cos_sched, decay_sched])
 
-        return {"optimizer": optim, "lr_scheduler": lr_sched}
+        return {"optimizer": optim, "lr_scheduler": decay_sched}
 
     def nan_hook(self, tracker: ModuleTracker):
         def _nan_hook(module, args, output):

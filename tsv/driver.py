@@ -9,13 +9,21 @@ from torchvision.datasets import MNIST
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from lightning.pytorch.callbacks import StochasticWeightAveraging
+import os
+from pathlib import Path
 
 parser = ArgumentParser()
 
-parser.add_argument("--fast-dev", type=bool, default=False)
+parser.add_argument("--fast-dev", action="store_true")
 parser.add_argument("--n-epochs", type=int, default=100)
 parser.add_argument("--batch-size", type=int, default=200)
+parser.add_argument("--load", type=str, default="")
+parser.add_argument("--log-dir", type=str, default="")
 args = parser.parse_args()
+
+
+LOGDIR = args.log_dir if args.log_dir else "logs"
+MODEL_NAME = "resnet_mnist"
 
 
 class MNISTDataModule(L.LightningDataModule):
@@ -60,45 +68,68 @@ class MNISTDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.mnist_train, batch_size=self.batch_size, num_workers=self.num_workers
+            self.mnist_train,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def val_dataloader(self):
         return DataLoader(
-            self.mnist_val, batch_size=self.batch_size, num_workers=self.num_workers
+            self.mnist_val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def test_dataloader(self):
         return DataLoader(
-            self.mnist_test, batch_size=self.batch_size, num_workers=self.num_workers
+            self.mnist_test,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
     def predict_dataloader(self):
         return DataLoader(
-            self.mnist_predict, batch_size=self.batch_size, num_workers=self.num_workers
+            self.mnist_predict,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
         )
 
 
-model = Resnet(
-    torch.randn(size=(1, 1, 28, 28)), num_encoder_scales=3, use_cross_entropy_loss=False
-)
-kaiming_init(model)
+load_path = os.path.join(LOGDIR, MODEL_NAME, f"version_{args.load}", "checkpoints")
+chkpt_path = None
+if os.path.exists(load_path):
+    chkpt_path = os.path.join(load_path, os.listdir(load_path)[0])
+    model = Resnet.load_from_checkpoint(chkpt_path)
+else:
+    model = Resnet(
+        torch.randn(size=(1, 1, 28, 28)),
+        num_encoder_scales=3,
+        use_cross_entropy_loss=False,
+    )
+    kaiming_init(model)
 summary(model, input_size=(1, 1, 28, 28))
-logger = TensorBoardLogger("logs", name="resnet_mnist")
+logger = TensorBoardLogger(LOGDIR, name=MODEL_NAME)
 
 # # train the model (hint: here are some helpful Trainer arguments for rapid idea iteration)
 trainer = L.Trainer(
     max_epochs=args.n_epochs,
-    fast_dev_run=False,
+    fast_dev_run=args.fast_dev,
     logger=logger,
     log_every_n_steps=10,
     gradient_clip_val=1,
     # detect_anomaly=True,
-    callbacks=[StochasticWeightAveraging(swa_lrs=1e-3, device="cuda")],
+    callbacks=[
+        StochasticWeightAveraging(swa_epoch_start=150, swa_lrs=5e-4, device="cuda")
+    ],
 )
 
 
 trainer.fit(
     model=model,
     datamodule=MNISTDataModule("MNIST", batch_size=args.batch_size, num_workers=31),
+    ckpt_path=chkpt_path,
 )
