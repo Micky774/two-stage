@@ -7,6 +7,11 @@ import io
 import PIL.Image
 from torchvision.transforms import ToTensor
 import lightning as L
+import umap
+import os
+from matplotlib.patches import Ellipse
+
+ENV = os.environ
 
 
 def spectral_norm(input_: torch.Tensor):
@@ -81,31 +86,35 @@ class Upsample(nn.Module):
 
 
 class ResidualConv(nn.Module):
-    def __init__(self, in_dim, out_dim, depth=2, kernel_size=3) -> None:
+    def __init__(self, in_dim, mid_dim, out_dim, depth=2, kernel_size=3) -> None:
         super().__init__()
-        self.up_channel_conv = nn.Conv2d(in_dim, out_dim, kernel_size, padding="same")
-        self.up_channel_prelu = nn.PReLU(out_dim)
+
+        num_channels = [in_dim] + [mid_dim] * depth + [out_dim]
         self.conv_modules = nn.ModuleList(
             [
-                nn.Conv2d(out_dim, out_dim, kernel_size, padding="same")
-                for _ in range(depth - 1)
+                nn.Conv2d(
+                    num_channels[i], num_channels[i + 1], kernel_size, padding="same"
+                )
+                for i in range(depth + 1)
             ]
         )
-        self.prelu_modules = nn.ModuleList(
-            [nn.PReLU(out_dim) for _ in range(depth - 1)]
+        self.prelu_modules = nn.ModuleList([nn.PReLU(dim) for dim in num_channels[1:]])
+        self.batch_norms = nn.ModuleList(
+            [nn.BatchNorm2d(dim) for dim in num_channels[:-1]]
         )
-        self.batch_norm = nn.BatchNorm2d(out_dim)
         self.bypass_prelu = nn.PReLU(out_dim)
-        self.bypass_conv = nn.Conv2d(in_dim, out_dim, kernel_size, padding="same")
+        self.bypass_conv = nn.Conv2d(in_dim, out_dim, 1, padding="same")
+        self.bypass_batch_norm = nn.BatchNorm2d(in_dim)
 
     def forward(self, x):
-        _x = x.clone()
-        y = self.up_channel_conv(x)
-        y = self.up_channel_prelu(y)
-        for conv, prelu in zip(self.conv_modules, self.prelu_modules):
-            y = self.batch_norm(y)
+        y = x
+        for conv, prelu, batch_norm in zip(
+            self.conv_modules, self.prelu_modules, self.batch_norms
+        ):
+            y = batch_norm(y)
             y = prelu(conv(y))
-        return y + self.bypass_prelu(self.bypass_conv(_x))
+        x = self.bypass_batch_norm(x)
+        return y + self.bypass_prelu(self.bypass_conv(x))
 
 
 class ResidualFC(nn.Module):
@@ -122,43 +131,39 @@ class ResidualFC(nn.Module):
         self.bypass_prelu = nn.PReLU(out_dim)
 
     def forward(self, x):
-        _x = x.clone()
         y = self.up_feature_fc(x)
         for fc, prelu in zip(self.fc_modules, self.prelu_modules):
             y = prelu(y)
             y = fc(y)
-        return self.bypass_prelu(y + self.bypass_fc(_x))
+        return self.bypass_prelu(y + self.bypass_fc(x))
 
 
 class ScaleBlock(nn.Module):
     def __init__(
         self,
         in_dim,
+        mid_dim,
         out_dim,
-        is_training,
+        block_dim,
         block_per_scale=1,
         depth_per_block=2,
         kernel_size=3,
     ) -> None:
         super().__init__()
-        self.is_training = is_training
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.up_channel_block = ResidualConv(
-            in_dim, out_dim, depth_per_block, kernel_size
-        )
+        n_dims = [in_dim] + [mid_dim] * block_per_scale + [out_dim]
         self.blocks = nn.ModuleList(
             [
-                ResidualConv(out_dim, out_dim, depth_per_block, kernel_size)
-                for _ in range(block_per_scale - 1)
+                ResidualConv(
+                    n_dims[i], block_dim, n_dims[i + 1], depth_per_block, kernel_size
+                )
+                for i in range(block_per_scale + 1)
             ]
         )
 
     def forward(self, x):
-        y = self.up_channel_block(x)
         for block in self.blocks:
-            y = block(y)
-        return y
+            x = block(x)
+        return x
 
 
 class ScaleFCBlock(nn.Module):
@@ -179,7 +184,7 @@ class ScaleFCBlock(nn.Module):
         return y
 
 
-def kaiming_init(model: nn.Module):
+def kaiming_init(model: nn.Module, a=0.25):
     for name, param in model.named_parameters():
         if name.endswith(".bias"):
             param.data.fill_(0)
@@ -188,9 +193,10 @@ def kaiming_init(model: nn.Module):
         elif "log_gamma" in name or "batch_norm" in name:
             pass
         elif "fc" in name:
-            nn.init.kaiming_uniform_(param.data, a=0.25, mode="fan_out")
+            print(f"Initializing {name} as a linear layer")
+            nn.init.kaiming_normal_(param.data, a=a, mode="fan_out")
         elif "conv" in name:
-            nn.init.kaiming_uniform_(param.data, a=0.25, mode="fan_out")
+            nn.init.kaiming_normal_(param.data, a=a, mode="fan_out")
         else:
             print(f"Skipping {name} initialization")
 
@@ -211,6 +217,42 @@ def plot_to_image(fig):
     return image
 
 
+class DeconvDecoder(L.LightningModule):
+    def __init__(self, input_shape, lsdim, channels_per_layer=64):
+        super().__init__()
+        self.input_channels = input_shape[1]
+        self.lsdim = lsdim
+
+        # (3, 3)
+        self.in_conv = nn.ConvTranspose2d(lsdim, channels_per_layer, kernel_size=3)
+
+        # (8, 8)
+        # (16, 16)
+        # (32, 32)
+        self.convs = nn.ModuleList(
+            [
+                nn.ConvTranspose2d(
+                    channels_per_layer, channels_per_layer, kernel_size=3, stride=2
+                )
+                for _ in range(2)
+            ]
+            + [
+                nn.ConvTranspose2d(
+                    channels_per_layer, channels_per_layer, kernel_size=4, stride=2
+                )
+            ]
+        )
+        self.out_conv = nn.Conv2d(channels_per_layer, self.input_channels, 1)
+
+    def forward(self, z):
+        t = z.view(-1, self.lsdim, 1, 1)
+        t = F.leaky_relu(self.in_conv(t))
+        for conv in self.convs:
+            t = F.leaky_relu(conv(t))
+        t = self.out_conv(t)
+        return t
+
+
 class SBD(L.LightningModule):
     """
     Constructs spatial broadcast decoder
@@ -221,35 +263,46 @@ class SBD(L.LightningModule):
     @param channels list of output-channels for each of the four size-preserving convolutional layers
     """
 
-    def __init__(self, input_length, lsdim, kernel_size=3, channels_per_layer=64):
+    def __init__(
+        self,
+        input_shape,
+        lsdim,
+        kernel_size=3,
+        channels_per_layer=64,
+        num_blocks=3,
+        layers_per_block=3,
+    ):
         super().__init__()
-        self.input_length = input_length
+        self.input_length = input_shape[-1]
+        self.input_channels = input_shape[1]
         self.lsdim = lsdim
-        assert kernel_size % 2 == 1, "Kernel size must be odd"
-        padding = int((kernel_size - 1) / 2)
         # Size-Preserving Convolutions
-        self.conv1 = nn.Conv2d(
-            lsdim + 2, channels_per_layer, kernel_size=kernel_size, padding=padding
+        num_channels = (
+            [lsdim + 2] + [channels_per_layer] * num_blocks + [self.input_channels]
         )
-        self.conv2 = nn.Conv2d(
-            channels_per_layer,
-            channels_per_layer,
-            kernel_size=kernel_size,
-            padding=padding,
+        self.blocks = nn.ModuleList(
+            [
+                ResidualConv(
+                    num_channels[i],
+                    channels_per_layer,
+                    num_channels[i + 1],
+                    depth=layers_per_block,
+                    kernel_size=kernel_size,
+                )
+                for i in range(num_blocks + 1)
+            ]
         )
-        self.conv3 = nn.Conv2d(
-            channels_per_layer,
-            channels_per_layer,
-            kernel_size=kernel_size,
-            padding=padding,
-        )
-        self.conv4 = nn.Conv2d(
-            channels_per_layer,
-            channels_per_layer,
-            kernel_size=kernel_size,
-            padding=padding,
-        )
-        self.conv5 = nn.Conv2d(channels_per_layer, 1, 1)
+        stepTensor = torch.linspace(-1, 1, self.input_length)
+        self.register_buffer("xAxisVector", stepTensor.view(1, 1, self.input_length, 1))
+        self.register_buffer("yAxisVector", stepTensor.view(1, 1, 1, self.input_length))
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="leaky_relu", a=0.25
+                )
+            if isinstance(m, nn.PReLU):
+                nn.init.constant_(m.weight, 0.25)
 
     """
     Applies the spatial broadcast decoder to a code z
@@ -262,37 +315,90 @@ class SBD(L.LightningModule):
         baseVector = z.view(-1, self.lsdim, 1, 1)
         base = baseVector.repeat(1, 1, self.input_length, self.input_length)
 
-        stepTensor = torch.linspace(-1, 1, self.input_length)
+        xPlane = self.xAxisVector.repeat(z.shape[0], 1, 1, self.input_length).to(
+            self.device
+        )
+        yPlane = self.yAxisVector.repeat(z.shape[0], 1, self.input_length, 1).to(
+            self.device
+        )
 
-        xAxisVector = stepTensor.view(1, 1, self.input_length, 1)
-        yAxisVector = stepTensor.view(1, 1, 1, self.input_length)
-
-        xPlane = xAxisVector.repeat(z.shape[0], 1, 1, self.input_length).to(self.device)
-        yPlane = yAxisVector.repeat(z.shape[0], 1, self.input_length, 1).to(self.device)
-
-        base = torch.cat((xPlane, yPlane, base), 1)
-
-        x = F.leaky_relu(self.conv1(base))
-        x = F.leaky_relu(self.conv2(x))
-        x = F.leaky_relu(self.conv3(x))
-        x = F.leaky_relu(self.conv4(x))
-        x = F.leaky_relu(self.conv5(x))
-
-        return x
+        t = torch.cat((xPlane, yPlane, base), 1)
+        for block in self.blocks:
+            t = block(t)
+        return t
 
 
-def generate_embedding(train_dataloader, encoder, device, tb, current_epoch):
-    fig, axes = plt.subplots(1, 1)
+def generate_embedding(
+    train_dataloader,
+    encoder,
+    device,
+    tb,
+    current_epoch,
+    mu_p=None,
+    logvar_p=None,
+    transform=lambda x: x,
+):
     embeddings = []
-    labels = []
+    targets = []
     for batch in train_dataloader:
         x, y = batch
-        z, *_ = encoder(x.to(device))
+        z = encoder(x.to(device))
+        z = transform(z)
         embeddings.append(z.detach().cpu().numpy())
-        labels.append(y.detach().cpu().numpy())
+        targets.append(y.detach().cpu().numpy())
+
     embeddings = np.concatenate(embeddings)
-    labels = np.concatenate(labels)
-    axes.scatter(embeddings[:, 0], embeddings[:, 1], c=labels)
+    targets = np.concatenate(targets)
+    fig, axes = plt.subplots(1, 1, figsize=(10, 10))
+    print(f"Embeddings shape: {embeddings.shape}")
+    if embeddings.shape[-1] > 2:
+        if current_epoch % 50 != 0:
+            rng = np.random.RandomState(current_epoch)
+            sample_idxs = rng.choice(len(embeddings), 4000)
+            embeddings = embeddings[sample_idxs]
+            targets = targets[sample_idxs]
+        reducer = umap.UMAP(min_dist=0)
+
+        visual_embedding = reducer.fit_transform(embeddings)
+        if mu_p is not None:
+            mu_p = mu_p.detach().cpu().numpy()
+            embedded_pseudos = reducer.transform(mu_p)
+    else:
+        if logvar_p is not None:
+            logvar_p = logvar_p.detach().cpu().numpy()
+            std_p = np.exp(0.5 * logvar_p)
+        visual_embedding = embeddings
+        if mu_p is not None:
+            embedded_pseudos = mu_p.detach().cpu().numpy()
+            for embedded_pseudo, std in zip(embedded_pseudos, std_p):
+                print(f"Making ellipse at {embedded_pseudo} with std {std}")
+                axes.add_patch(
+                    Ellipse(
+                        xy=embedded_pseudo,
+                        width=3 * std[0],
+                        height=3 * std[1],
+                        edgecolor="r",
+                        fc="grey",
+                        lw=2,
+                    )
+                )
+    assert targets is not None
+    axes.scatter(
+        visual_embedding[:, 0],
+        visual_embedding[:, 1],
+        c=targets,
+        s=0.75,
+        cmap="tab10",
+    )
+    if mu_p is not None:
+        axes.scatter(
+            embedded_pseudos[:, 0],
+            embedded_pseudos[:, 1],
+            c="black",
+            s=50,
+            marker="x",
+        )
+
     tb.add_image(
         f"Latent Space",
         plot_to_image(fig),

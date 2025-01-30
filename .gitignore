@@ -163,3 +163,8 @@ cython_debug/
 
 # Data for testing
 MNIST/
+CIFAR10/
+FMNIST/
+logs/
+embeddings/
+dummy.ipynb
