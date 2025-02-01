@@ -45,8 +45,8 @@ if __name__ == "__main__":
     for batch in tqdm(train_data):
         x, y = batch
         z = model(x.to(model.device))[-1]
-        embeddings.append(z.detach().cpu().numpy())
-        labels.append(y.detach().cpu().numpy())
+        embeddings.append(z.cpu().numpy())
+        labels.append(y.cpu().numpy())
 
     print("Concatenating embeddings")
     embeddings = np.concatenate(embeddings)

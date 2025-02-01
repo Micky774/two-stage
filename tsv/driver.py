@@ -75,6 +75,8 @@ parser.add_argument("--one-cycle-warmup", type=float, default=0.3)
 parser.add_argument("--decoder", type=str, default="sbd", choices=["sbd"])
 parser.add_argument("--grad-clip-val", type=float, default=10)
 parser.add_argument("--weight-decay", type=float, default=4e-4)
+parser.add_argument("--max-batch-size", type=int, default=256)
+parser.add_argument("--load-from-pt", action="store_true")
 parser.add_argument(
     "--grad-clip-alg", type=str, default="norm", choices=["norm", "value"]
 )
@@ -105,6 +107,21 @@ SAMPLE_INPUT = torch.zeros(
 )
 # if args.model == "resnet-50":
 #     SAMPLE_INPUT = torch.zeros((args.batch_size, 3, 224, 224))
+
+
+class BatchSizeScheduler(Callback):
+    def __init__(self, func, max_batch_size=50, min_batch_size=0.5):
+        super().__init__()
+        self.max_batch_size = max_batch_size
+        self.min_batch_size = min_batch_size
+        self.func = func
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = pl_module.current_epoch
+        pl_module.batch_size = self.func(
+            epoch, self.min_batch_size, self.max_batch_size
+        )
+        return
 
 
 class BetaScheduler(Callback):
@@ -248,28 +265,41 @@ def _make_cls_kwargs():
     return cls_kwargs
 
 
+def _load(load_path):
+    if args.load_from_pt:
+        load_path = os.path.join(load_path, "model.pt")
+        print(f"Loading from {load_path}")
+        return torch.load(load_path)
+
+    load_path = os.path.join(load_path, "checkpoints")
+    if not os.path.exists(chkpt_path):
+        raise ValueError(f"Checkpoint at {chkpt_path} not found.")
+    print(f"Checking for checkpoints at {load_path}")
+    checkpoints = os.listdir(load_path)
+    splits = [re.split("[=-]", s) for s in checkpoints]
+    epoch_counts = [int(s[1]) for s in splits]
+    if args.load_epoch != -1:
+        idx = np.argmin(np.abs(np.array(epoch_counts) - args.load_epoch))
+    else:
+        idx = np.argmax(epoch_counts)
+    chkpt_path = os.path.join(load_path, checkpoints[idx])
+    print(f"Loading from {chkpt_path}")
+
+    cls_kwargs = __make_cls_kwargs()
+    model = CLS.load_from_checkpoint(chkpt_path, **cls_kwargs)
+    return model
+
+
 if __name__ == "__main__":
     # cli_main()
     chkpt_path = None
     load_path = None
     CLS = get_model_cls(args.model)
     if args.load != "":
-        load_path = os.path.join(LOGDIR, args.model, args.load, "checkpoints")
+        load_path = os.path.join(LOGDIR, args.model, args.load)
+        chkpt_path = os.path.join(load_path, "checkpoints")
     if load_path is not None and os.path.exists(load_path):
-        print(f"Checking for checkpoints at {load_path}")
-        checkpoints = os.listdir(load_path)
-        splits = [re.split("[=-]", s) for s in checkpoints]
-        epoch_counts = [int(s[1]) for s in splits]
-        if args.load_epoch != -1:
-            idx = np.argmin(np.abs(np.array(epoch_counts) - args.load_epoch))
-        else:
-            idx = np.argmax(epoch_counts)
-        chkpt_path = os.path.join(load_path, checkpoints[idx])
-        print(f"Loading from {chkpt_path}")
-
-        cls_kwargs = __make_cls_kwargs()
-        model = CLS.load_from_checkpoint(chkpt_path, **cls_kwargs)
-
+        model = _load(load_path)
     else:
         cls_kwargs = __make_cls_kwargs()
         model = CLS(**cls_kwargs)
@@ -295,6 +325,7 @@ if __name__ == "__main__":
         gradient_clip_val=args.grad_clip_val,
         gradient_clip_algorithm=args.grad_clip_alg,
         log_every_n_steps=10,
+        sync_batchnorm=True,
         # strategy="ddp_find_unused_parameters_true",
         # overfit_batches=1,
         # detect_anomaly=True,
@@ -302,6 +333,11 @@ if __name__ == "__main__":
             # BatchSizeFinder(mode="binsearch", init_val=1000),
             # LearningRateFinder(min_lr=1e-6, max_lr=1e-1, num_training_steps=40),
             ModelSummary(max_depth=7),
+            # BatchSizeScheduler(
+            #     lambda epoch, min, max: min + (max - min) * (epoch + 1) / 100,
+            #     max_batch_size=args.max_batch_size,
+            #     min_batch_size=args.batch_size,
+            # ),
             # BetaScheduler(T=50, R=0.5),
             # StochasticWeightAveraging(swa_epoch_start=100, swa_lrs=1e-3, device="cuda"),
         ],
@@ -331,7 +367,6 @@ if __name__ == "__main__":
             transforms=transforms,
         ),
     }[args.dataset]
-
     trainer.fit(
         model=model,
         datamodule=datamodule,

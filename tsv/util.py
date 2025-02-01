@@ -86,7 +86,9 @@ class Upsample(nn.Module):
 
 
 class ResidualConv(nn.Module):
-    def __init__(self, in_dim, mid_dim, out_dim, depth=2, kernel_size=3) -> None:
+    def __init__(
+        self, input_shape, in_dim, mid_dim, out_dim, depth=2, kernel_size=3
+    ) -> None:
         super().__init__()
 
         num_channels = [in_dim] + [mid_dim] * depth + [out_dim]
@@ -98,23 +100,26 @@ class ResidualConv(nn.Module):
                 for i in range(depth + 1)
             ]
         )
-        self.prelu_modules = nn.ModuleList([nn.PReLU(dim) for dim in num_channels[1:]])
-        self.batch_norms = nn.ModuleList(
-            [nn.BatchNorm2d(dim) for dim in num_channels[:-1]]
+        # No activation on final output -- let the consumer decide
+        self.activation_funcs = nn.ModuleList(
+            [nn.LeakyReLU() for _ in range(depth)] + [nn.Identity()]
         )
-        self.bypass_prelu = nn.PReLU(out_dim)
+        self.batch_norms = nn.ModuleList(
+            [nn.LayerNorm((dim, *input_shape)) for dim in num_channels[:-1]]
+        )
+        self.bypass_activation_func = nn.LeakyReLU()
         self.bypass_conv = nn.Conv2d(in_dim, out_dim, 1, padding="same")
-        self.bypass_batch_norm = nn.BatchNorm2d(in_dim)
+        self.bypass_batch_norm = nn.LayerNorm((in_dim, *input_shape))
 
     def forward(self, x):
         y = x
-        for conv, prelu, batch_norm in zip(
-            self.conv_modules, self.prelu_modules, self.batch_norms
+        for conv, activation, batch_norm in zip(
+            self.conv_modules, self.activation_funcs, self.batch_norms
         ):
             y = batch_norm(y)
-            y = prelu(conv(y))
+            y = activation(conv(y))
         x = self.bypass_batch_norm(x)
-        return y + self.bypass_prelu(self.bypass_conv(x))
+        return y + self.bypass_conv(x)
 
 
 class ResidualFC(nn.Module):
@@ -141,6 +146,7 @@ class ResidualFC(nn.Module):
 class ScaleBlock(nn.Module):
     def __init__(
         self,
+        input_shape,
         in_dim,
         mid_dim,
         out_dim,
@@ -154,16 +160,22 @@ class ScaleBlock(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 ResidualConv(
-                    n_dims[i], block_dim, n_dims[i + 1], depth_per_block, kernel_size
+                    input_shape,
+                    n_dims[i],
+                    block_dim,
+                    n_dims[i + 1],
+                    depth_per_block,
+                    kernel_size,
                 )
                 for i in range(block_per_scale + 1)
             ]
         )
 
     def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        return x
+        # No activation on final output -- let the consumer decide
+        for block in self.blocks[:-1]:
+            x = F.leaky_relu(block(x))
+        return self.blocks[-1](x)
 
 
 class ScaleFCBlock(nn.Module):
@@ -184,19 +196,22 @@ class ScaleFCBlock(nn.Module):
         return y
 
 
-def kaiming_init(model: nn.Module, a=0.25):
+def kaiming_init(model: nn.Module, a=0.01):
     for name, param in model.named_parameters():
         if name.endswith(".bias"):
+            print(f"Initializing {name} as a bias")
             param.data.fill_(0)
         elif "prelu" in name:
+            print(f"Initializing {name} as a PReLU")
             param.data.fill_(0.25)
         elif "log_gamma" in name or "batch_norm" in name:
             pass
         elif "fc" in name:
             print(f"Initializing {name} as a linear layer")
-            nn.init.kaiming_normal_(param.data, a=a, mode="fan_out")
+            nn.init.kaiming_normal_(param.data, a=a)
         elif "conv" in name:
-            nn.init.kaiming_normal_(param.data, a=a, mode="fan_out")
+            print(f"Initializing {name} as a convolutional layer")
+            nn.init.kaiming_normal_(param.data, a=a)
         else:
             print(f"Skipping {name} initialization")
 
@@ -283,6 +298,7 @@ class SBD(L.LightningModule):
         self.blocks = nn.ModuleList(
             [
                 ResidualConv(
+                    input_shape[-2:],
                     num_channels[i],
                     channels_per_layer,
                     num_channels[i + 1],
@@ -296,13 +312,7 @@ class SBD(L.LightningModule):
         self.register_buffer("xAxisVector", stepTensor.view(1, 1, self.input_length, 1))
         self.register_buffer("yAxisVector", stepTensor.view(1, 1, 1, self.input_length))
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight, mode="fan_out", nonlinearity="leaky_relu", a=0.25
-                )
-            if isinstance(m, nn.PReLU):
-                nn.init.constant_(m.weight, 0.25)
+        kaiming_init(self)
 
     """
     Applies the spatial broadcast decoder to a code z
@@ -324,7 +334,7 @@ class SBD(L.LightningModule):
 
         t = torch.cat((xPlane, yPlane, base), 1)
         for block in self.blocks:
-            t = block(t)
+            t = F.leaky_relu(block(t))
         return t
 
 

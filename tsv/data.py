@@ -48,6 +48,7 @@ class CIFAR10DataModule(L.LightningDataModule):
             self.ground_truth_labels = self.train_data.targets
             if self.estimated_labels is not None:
                 self.train_data.targets = self.estimated_labels
+            self.count = len(self.train_data)
 
         # Assign test dataset for use in dataloader(s)
         if stage == "test":
@@ -57,6 +58,7 @@ class CIFAR10DataModule(L.LightningDataModule):
                 transform=self.transform,
                 download=True,
             )
+            self.count = len(self.test_data)
 
     def train_dataloader(self):
         return DataLoader(
@@ -114,28 +116,30 @@ class FMNISTDataModule(L.LightningDataModule):
     def setup(self, stage: str):
         # Assign train/val datasets for use in dataloaders
         if stage == "fit":
-            self.fmnist_train = FashionMNIST(
+            self.train_data = FashionMNIST(
                 self.data_dir,
                 train=True,
                 transform=self.transform,
                 download=True,
             )
-            self.ground_truth_labels = self.fmnist_train.targets
+            self.ground_truth_labels = self.train_data.targets
             if self.estimated_labels is not None:
-                self.fmnist_train.targets = self.estimated_labels
+                self.train_data.targets = self.estimated_labels
+            self.count = len(self.train_data)
 
         # Assign test dataset for use in dataloader(s)
         if stage == "test":
-            self.fmnist_test = FashionMNIST(
+            self.test_data = FashionMNIST(
                 self.data_dir,
                 train=False,
                 transform=self.transform,
                 download=True,
             )
+            self.count = len(self.test_data)
 
     def train_dataloader(self):
         return DataLoader(
-            self.fmnist_train,
+            self.train_data,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=self.shuffle,
@@ -146,7 +150,7 @@ class FMNISTDataModule(L.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(
-            self.fmnist_test,
+            self.test_data,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=self.shuffle,
@@ -189,27 +193,29 @@ class MNISTDataModule(L.LightningDataModule):
     def setup(self, stage: str):
         # Assign train/val datasets for use in dataloaders
         if stage == "fit":
-            self.mnist_train = MNIST(
+            self.train_data = MNIST(
                 self.data_dir,
                 train=True,
                 transform=self.transform,
                 download=True,
             )
             if self.estimated_labels is not None:
-                self.mnist_train.targets = self.estimated_labels
+                self.train_data.targets = self.estimated_labels
+            self.count = len(self.train_data)
 
         # Assign test dataset for use in dataloader(s)
         if stage == "test":
-            self.mnist_test = MNIST(
+            self.test_data = MNIST(
                 self.data_dir,
                 train=False,
                 transform=self.transform,
                 download=True,
             )
+            self.count = len(self.test_data)
 
     def train_dataloader(self):
         return DataLoader(
-            self.mnist_train,
+            self.train_data,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=self.shuffle,
@@ -219,7 +225,7 @@ class MNISTDataModule(L.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(
-            self.mnist_test,
+            self.test_data,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=self.shuffle,
