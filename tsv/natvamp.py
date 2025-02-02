@@ -488,15 +488,26 @@ class ModularNVP(ModularVAE):
         self.save_hyperparameters()
 
     def project_pseudos(self):
+        # Corresponds to MLE estimate of the pseudos on the data manifold
         self.pseudos = nn.Parameter(self.p_x(self.q_z(self.get_pseudos())[0])).type_as(
             self.pseudos
         )
 
     def merge_pseudos(self, indices):
-        for i, idx in enumerate(indices[1:]):
-            self._merge_pseudos_pair(indices[0], idx - i)
+        num_indices = len(indices)
+        for i in range(num_indices):
+            idx, jdx = indices[i]
+            for j in range(i + 1, num_indices):
+                ii, jj = indices[j]
+                if ii > jdx:
+                    ii -= 1
+                if jj > jdx:
+                    jj -= 1
+                indices[j] = (ii, jj)
+            self._merge_pseudos_pair(idx, jdx)
 
     def _merge_pseudos_pair(self, idx, jdx):
+        print(f"Merging {idx} and {jdx}")
         if idx == jdx:
             raise ValueError("Cannot merge the same pseudo")
         elif idx > jdx:
@@ -505,7 +516,13 @@ class ModularNVP(ModularVAE):
         pseudos = self.get_pseudos()
         mu_p = self.q_z(pseudos)[0]
         mu = torch.mean(mu_p[[idx, jdx]], dim=0, keepdim=True)
+        # plt.imshow(self.p_x(mu_p[idx : idx + 1]).view(28, 28).numpy(force=True))
+        # plt.show()
+        # plt.imshow(self.p_x(mu_p[jdx : jdx + 1]).view(28, 28).numpy(force=True))
+        # plt.show()
         new_pseudo = self.p_x(mu)
+        # plt.imshow(new_pseudo.view(28, 28).numpy(force=True))
+        # plt.show()
         pseudos[idx : idx + 1] = new_pseudo
         pseudos[jdx:-1] = pseudos[jdx + 1 :].clone()
         self.pseudos = nn.Parameter(pseudos[: self.num_pseudos]).type_as(self.pseudos)
