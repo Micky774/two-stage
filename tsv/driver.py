@@ -3,7 +3,7 @@ import torch
 import lightning as L
 from torchinfo import summary
 from lightning.pytorch.loggers import TensorBoardLogger
-from .data import MNISTDataModule, FMNISTDataModule, CIFAR10DataModule
+from .data import MNISTDataModule, FMNISTDataModule, CIFAR10DataModule, LatentDataModule
 from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import (
     StochasticWeightAveraging,
@@ -13,10 +13,8 @@ from lightning.pytorch.callbacks import (
 from .util import kaiming_init
 import os
 from .natvamp import get_model_cls, get_encoder_cls, get_decoder_cls
-from lightning.pytorch.cli import LightningCLI
 import re
 import numpy as np
-from lightning.pytorch.profilers import AdvancedProfiler
 
 
 parser = ArgumentParser()
@@ -67,16 +65,19 @@ parser.add_argument("--intermediate-channels", type=int, default=32)
 parser.add_argument("--encoder-block-channels", type=int, default=32)
 parser.add_argument("--sample-size", type=int, default=1)
 parser.add_argument("--freeze-pseudos", type=int, default=0)
-parser.add_argument("--freeze-gamma", type=int, default=0)
 parser.add_argument("--freeze-encoder", type=int, default=0)
 parser.add_argument("--train-pseudos", action="store_true")
 parser.add_argument("--pseudo-lr", type=float, default=None)
 parser.add_argument("--one-cycle-warmup", type=float, default=0.3)
-parser.add_argument("--decoder", type=str, default="sbd", choices=["sbd"])
+parser.add_argument("--decoder", type=str, default="sbd", choices=["sbd", "dense"])
 parser.add_argument("--grad-clip-val", type=float, default=10)
 parser.add_argument("--weight-decay", type=float, default=4e-4)
 parser.add_argument("--max-batch-size", type=int, default=256)
-parser.add_argument("--load-from-pt", action="store_true")
+parser.add_argument("--load-from-pt", type=str, default=None)
+parser.add_argument("--disable-gamma", action="store_true")
+parser.add_argument("--omega", type=float, default=0)
+parser.add_argument("--sbd-depth", type=int, default=None)
+parser.add_argument("--embedding-path", type=str, default=None)
 parser.add_argument(
     "--grad-clip-alg", type=str, default="norm", choices=["norm", "value"]
 )
@@ -91,7 +92,7 @@ parser.add_argument(
     "--encoder",
     type=str,
     default="basic",
-    choices=["resnet", "basic", "pretrained-resnet"],
+    choices=["resnet", "basic", "pretrained-resnet", "dense"],
 )
 
 args = parser.parse_args()
@@ -100,11 +101,13 @@ seed_everything(args.random_seed, workers=True)
 
 LOGDIR = args.log_dir if args.log_dir else "logs"
 
-SAMPLE_INPUT = torch.zeros(
-    (args.batch_size, 3, 32, 32)
-    if args.dataset == "cifar10"
-    else (args.batch_size, 1, 28, 28)
-)
+SAMPLE_INPUT = {
+    "mnist": torch.zeros((args.batch_size, 1, 28, 28)),
+    "fmnist": torch.zeros((args.batch_size, 1, 28, 28)),
+    "cifar10": torch.zeros((args.batch_size, 3, 32, 32)),
+    "latent": torch.zeros((args.batch_size, args.latent_dim)),
+}[args.dataset]
+
 # if args.model == "resnet-50":
 #     SAMPLE_INPUT = torch.zeros((args.batch_size, 3, 224, 224))
 
@@ -157,7 +160,12 @@ def __make_cls_kwargs():
         momentum=args.momentum,
         weight_decay=args.weight_decay,
         one_cycle_warmup=args.one_cycle_warmup,
+        enable_gamma=not args.disable_gamma,
     )
+    if args.decoder == "dense":
+        decoder_kwargs = dict(
+            layer_spec=[256] * 2,
+        )
     if args.decoder == "sbd":
         decoder_kwargs = dict(
             input_shape=SAMPLE_INPUT.shape,
@@ -181,15 +189,7 @@ def __make_cls_kwargs():
         encoder_kwargs = dict(
             input_shape=SAMPLE_INPUT.shape,
         )
-    elif args.encoder == "pretrained-resnet":
-        cls_kwargs.update(
-            dict(
-                pretrained=args.pretrained,
-                freeze_gamma=args.freeze_gamma,
-                freeze_encoder=args.freeze_encoder,
-            )
-        )
-    if "nvp" in args.model:
+    if any((name in args.model for name in ("nvp", "lsv"))):
         cls_kwargs.update(
             dict(
                 num_pseudos=args.num_pseudos,
@@ -199,11 +199,22 @@ def __make_cls_kwargs():
                 train_pseudos=args.train_pseudos,
             )
         )
-    if "nvpw" in args.model:
+    if any((name in args.model for name in ("nvpw", "lsv"))):
         cls_kwargs.update(
             dict(
                 alpha=args.alpha,
+                omega=args.omega,
             )
+        )
+    if "nvpwb" in args.model:
+        cls_kwargs.update(
+            dict(
+                sbd_depth=args.sbd_depth,
+            )
+        )
+    if args.encoder == "dense":
+        encoder_kwargs = dict(
+            layer_spec=[256] * 4,
         )
     cls_kwargs["encoder_kwargs"] = encoder_kwargs
     cls_kwargs["decoder_kwargs"] = decoder_kwargs
@@ -212,97 +223,47 @@ def __make_cls_kwargs():
     return cls_kwargs
 
 
-def _make_cls_kwargs():
-    cls_kwargs = dict(
-        sample_input=SAMPLE_INPUT,
-        lsdim=args.latent_dim,
-        beta=args.beta,
-        delta=args.delta,
-        use_labels=args.labels_path != "",
-        lr=args.lr,
-        sbd_kernel_size=args.sbd_kernel_size,
-        num_decoder_scales=args.decoder_scales,
-        num_decoder_blocks=args.decoder_blocks,
-        num_decoder_layers_per_block=args.decoder_layers_per_block,
-        anneal_epochs=args.anneal_epochs,
-        constant_lr=args.constant_lr,
-        sbd_channels=args.sbd_channels,
-        one_cycle=args.one_cycle,
-        scheduler=args.scheduler,
-        momentum=args.momentum,
-        one_cycle_warmup=args.one_cycle_warmup,
-    )
-    if args.model in ("resnet", "resnet-nvp"):
-        cls_kwargs.update(
-            dict(
-                blocks_per_scale=args.blocks_per_scale,
-                num_encoder_scales=args.encoder_scales,
-                base_channels=args.base_channels,
-                encoder_depth_per_block=args.encoder_depth_per_block,
-                encoder_block_channels=args.encoder_block_channels,
-                intermediate_channels=args.intermediate_channels,
-            )
-        )
-    if "nvp" in args.model:
-        cls_kwargs.update(
-            dict(
-                num_pseudos=args.num_pseudos,
-                alpha=args.alpha,
-                eta=args.eta,
-                sample_size=args.sample_size,
-                pseudo_lr=args.pseudo_lr,
-                train_pseudos=args.train_pseudos,
-            )
-        )
-    if args.model == "resnet-50":
-        cls_kwargs.update(
-            dict(
-                pretrained=args.pretrained,
-                freeze_gamma=args.freeze_gamma,
-                freeze_encoder=args.freeze_encoder,
-            )
-        )
-    return cls_kwargs
-
-
-def _load(load_path):
-    if args.load_from_pt:
-        load_path = os.path.join(load_path, "model.pt")
+def _load(_cls, load_path, load_from_pt=None, load_epoch=-1, cls_kwargs=None):
+    if load_from_pt is not None:
+        load_path = os.path.join(load_path, load_from_pt)
         print(f"Loading from {load_path}")
-        return torch.load(load_path)
+        return torch.load(load_path), None
 
     load_path = os.path.join(load_path, "checkpoints")
-    if not os.path.exists(chkpt_path):
-        raise ValueError(f"Checkpoint at {chkpt_path} not found.")
+    if not os.path.exists(load_path):
+        raise ValueError(f"Checkpoint at {load_path} not found.")
     print(f"Checking for checkpoints at {load_path}")
     checkpoints = os.listdir(load_path)
     splits = [re.split("[=-]", s) for s in checkpoints]
     epoch_counts = [int(s[1]) for s in splits]
-    if args.load_epoch != -1:
-        idx = np.argmin(np.abs(np.array(epoch_counts) - args.load_epoch))
+    if load_epoch != -1:
+        idx = np.argmin(np.abs(np.array(epoch_counts) - load_epoch))
     else:
         idx = np.argmax(epoch_counts)
     chkpt_path = os.path.join(load_path, checkpoints[idx])
     print(f"Loading from {chkpt_path}")
 
-    cls_kwargs = __make_cls_kwargs()
-    model = CLS.load_from_checkpoint(chkpt_path, **cls_kwargs)
-    return model
+    if cls_kwargs is None:
+        cls_kwargs = __make_cls_kwargs()
+    model = _cls.load_from_checkpoint(chkpt_path, **cls_kwargs)
+    return model, chkpt_path
 
 
 if __name__ == "__main__":
     # cli_main()
     chkpt_path = None
-    load_path = None
-    CLS = get_model_cls(args.model)
-    if args.load != "":
-        load_path = os.path.join(LOGDIR, args.model, args.load)
-        chkpt_path = os.path.join(load_path, "checkpoints")
+    load_path = os.path.join(LOGDIR, args.model, args.load) if args.load != "" else None
+    _cls = get_model_cls(args.model)
     if load_path is not None and os.path.exists(load_path):
-        model = _load(load_path)
+        model, chkpt_path = _load(
+            _cls,
+            load_path,
+            load_from_pt=args.load_from_pt,
+            load_epoch=args.load_epoch,
+        )
     else:
         cls_kwargs = __make_cls_kwargs()
-        model = CLS(**cls_kwargs)
+        model = _cls(**cls_kwargs)
         if args.kaiming:
             kaiming_init(model, a=0.1)
 
@@ -314,7 +275,6 @@ if __name__ == "__main__":
         log_graph=True,
         version=args.version,
     )
-    profiler = AdvancedProfiler("profile", "out.txt")
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
@@ -342,7 +302,6 @@ if __name__ == "__main__":
             # StochasticWeightAveraging(swa_epoch_start=100, swa_lrs=1e-3, device="cuda"),
         ],
         # deterministic=True,
-        profiler=profiler,
     )
 
     transforms = getattr(model, "transforms", None)
@@ -361,6 +320,13 @@ if __name__ == "__main__":
             transforms=transforms,
         ),
         "cifar10": CIFAR10DataModule(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            labels_path=args.labels_path,
+            transforms=transforms,
+        ),
+        "latent": LatentDataModule(
+            data_path=args.embedding_path,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             labels_path=args.labels_path,

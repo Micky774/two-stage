@@ -168,3 +168,4 @@ FMNIST/
 logs/
 embeddings/
 dummy.ipynb
+local_artifacts/

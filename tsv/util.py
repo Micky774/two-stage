@@ -196,24 +196,27 @@ class ScaleFCBlock(nn.Module):
         return y
 
 
-def kaiming_init(model: nn.Module, a=0.01):
+def kaiming_init(model: nn.Module, a=0.01, debug=False):
     for name, param in model.named_parameters():
+        init_as = None
         if name.endswith(".bias"):
-            print(f"Initializing {name} as a bias")
+            init_as = "bias"
             param.data.fill_(0)
         elif "prelu" in name:
-            print(f"Initializing {name} as a PReLU")
+            init_as = "prelu"
             param.data.fill_(0.25)
         elif "log_gamma" in name or "batch_norm" in name:
             pass
         elif "fc" in name:
-            print(f"Initializing {name} as a linear layer")
+            init_as = "fc"
             nn.init.kaiming_normal_(param.data, a=a)
         elif "conv" in name:
-            print(f"Initializing {name} as a convolutional layer")
+            init_as = "conv"
             nn.init.kaiming_normal_(param.data, a=a)
         else:
-            print(f"Skipping {name} initialization")
+            init_as = "skip"
+        if debug:
+            print(f"Initialized {name} as {init_as}")
 
 
 def plot_to_image(fig):
@@ -359,8 +362,7 @@ def generate_embedding(
 
     embeddings = np.concatenate(embeddings)
     targets = np.concatenate(targets)
-    fig, axes = plt.subplots(1, 1, figsize=(10, 10))
-    print(f"Embeddings shape: {embeddings.shape}")
+    fig, axes = plt.subplots(1, 1, figsize=(20, 20))
     if embeddings.shape[-1] > 2:
         if current_epoch % 50 != 0:
             rng = np.random.RandomState(current_epoch)
@@ -381,7 +383,6 @@ def generate_embedding(
         if mu_p is not None:
             embedded_pseudos = mu_p.detach().cpu().numpy()
             for embedded_pseudo, std in zip(embedded_pseudos, std_p):
-                print(f"Making ellipse at {embedded_pseudo} with std {std}")
                 axes.add_patch(
                     Ellipse(
                         xy=embedded_pseudo,
@@ -397,7 +398,7 @@ def generate_embedding(
         visual_embedding[:, 0],
         visual_embedding[:, 1],
         c=targets,
-        s=0.75,
+        s=45 / np.sqrt(len(targets)),
         cmap="tab10",
     )
     if mu_p is not None:

@@ -11,10 +11,15 @@ from typing import Literal
 
 def get_model_cls(model_name) -> L.LightningModule:
     return {
-        "vae": ModularVAE,
-        "nvp": ModularNVP,
-        "nvpw": ModularNVPW,
-        "nvpwc": ModularNVPWC,
+        "vae": VAE,
+        "nvp": NVP,
+        "nvpw": NVPW,
+        "nvpwc": NVPWC,
+        "nvpwb": NVPWB,
+        "lsv": LSV,
+        "dlsv": DLSV,
+        "fdlsv": FDLSV,
+        "lvae": LVAE,
     }[model_name]
 
 
@@ -22,12 +27,14 @@ def get_encoder_cls(encoder_name) -> nn.Module:
     return {
         "basic": BasicEncoder,
         "resnet": ResnetEncoder,
+        "dense": DenseModule,
     }[encoder_name]
 
 
 def get_decoder_cls(decoder_name) -> nn.Module:
     return {
         "sbd": SBD,
+        "dense": DenseModule,
     }[decoder_name]
 
 
@@ -130,7 +137,7 @@ class BasicEncoder(L.LightningModule):
         return self.encoder(x).view(-1, self.FC_shape)
 
 
-class ModularVAE(L.LightningModule):
+class VAE(L.LightningModule):
     def __init__(
         self,
         sample_input,
@@ -146,6 +153,7 @@ class ModularVAE(L.LightningModule):
         momentum=0.9,
         weight_decay=4e-4,
         one_cycle_warmup=0.3,
+        enable_gamma=True,
         # data_mean: Tensor | None = torch.tensor((0.4914, 0.4822, 0.4465)),
         # data_std: Tensor | None = torch.tensor((0.247, 0.243, 0.261)),
         encoder_cls=None,
@@ -181,22 +189,25 @@ class ModularVAE(L.LightningModule):
         self.momentum = momentum
         self.weight_decay = weight_decay
         self.one_cycle_warmup = one_cycle_warmup
+        self.enable_gamma = enable_gamma
         self.encoder_cls = encoder_cls
         self.decoder_cls = decoder_cls
         self.encoder_kwargs = encoder_kwargs if encoder_kwargs else {}
         self.decoder_kwargs = decoder_kwargs if decoder_kwargs else {}
 
+        self._setup()
+        self.save_hyperparameters()
+
+    def _setup(self):
         self.build_encoder()
         self.FC_shape = self.encoder.FC_shape
         self.build_decoder()
 
-        self.log_gamma = nn.Parameter(torch.zeros(1))
+        self.log_gamma = nn.Parameter(torch.zeros(1), self.enable_gamma)
 
         self.reducer = reducers.SumReducer()
         self.metric_loss_func = losses.NTXentLoss(temperature=0.1, reducer=self.reducer)
         self.miner = miners.BatchEasyHardMiner()
-
-        self.save_hyperparameters()
 
     def build_decoder(self):
         self.decoder = self.decoder_cls(**self.decoder_kwargs)
@@ -207,13 +218,10 @@ class ModularVAE(L.LightningModule):
         self.logvar = nn.Linear(self.encoder.FC_shape, self.lsdim)
         self.batch_norm = nn.LayerNorm(self.encoder.FC_shape)
 
-    def reconstruct_x(self, x):
-        x_mean, _, _, _ = self.forward(x)
-        return x_mean
-
     # THE MODEL: VARIATIONAL POSTERIOR
     def q_z(self, x):
         x = self.encoder(x)
+        x = F.selu(x)
         x = self.batch_norm(x)
         z_q_mean = self.mean(x)
         z_q_logvar = self.logvar(x)
@@ -253,7 +261,7 @@ class ModularVAE(L.LightningModule):
         return self.metric_loss_func(z, labels, mined)
 
     def mse_loss(self, x, x_hat, logvar=None):
-        logvar = self.log_gamma if logvar is None else logvar
+        logvar = getattr(self, "log_gamma", 0) if logvar is None else logvar
         recon_loss = torch.square((x - x_hat))
         recon_loss /= torch.exp(logvar)
         recon_loss += logvar
@@ -262,6 +270,9 @@ class ModularVAE(L.LightningModule):
 
     def recon_loss(self, x, x_hat):
         return self.mse_loss(x, x_hat)
+
+    def kl_divergence(self, mu, logvar, *args, **kwargs):
+        return self.unit_kl(mu, logvar)
 
     # Reconstruction + KL divergence losses summed over all elements and batch
     def loss_function(
@@ -272,6 +283,7 @@ class ModularVAE(L.LightningModule):
         logvar,
         z,
         labels=None,
+        reduction="mean",
     ):
         recon_loss = self.recon_loss(x, x_hat)
 
@@ -285,20 +297,19 @@ class ModularVAE(L.LightningModule):
             metric_loss = self.metric_loss(z, labels)
 
         # KL
-        kl_loss = self.unit_kl(mu, logvar)
+        kl_loss = self.kl_divergence(mu, logvar)
 
-        return (
-            recon_loss / x.size(0),
-            kl_loss / x.size(0),
-            metric_loss / x.size(0),
-        )
+        if reduction == "mean":
+            recon_loss /= x.size(0)
+        return (recon_loss, kl_loss, metric_loss)
 
-    def general_kl(self, mu_1, logvar_1, mu_2, logvar_2):
+    def general_kl(self, mu_1, logvar_1, mu_2, logvar_2, dim=None):
         return -0.5 * torch.sum(
             1
             + logvar_1
             - logvar_2
-            - (torch.square(mu_1 - mu_2) + torch.exp(logvar_1)) / torch.exp(logvar_2)
+            - (torch.square(mu_1 - mu_2) + torch.exp(logvar_1)) / torch.exp(logvar_2),
+            dim=dim,
         )
 
     # KL Divergence between a parameterized gaussian, and a unit gaussian
@@ -326,8 +337,10 @@ class ModularVAE(L.LightningModule):
                 "metric_loss": metric_loss,
                 "learning rate": self.trainer.optimizers[0].param_groups[0]["lr"],
                 "raw_MSE": F.mse_loss(x_hat, x, reduction="mean"),
-                "gamma": torch.exp(self.log_gamma),
             }
+            if hasattr(self, "log_gamma"):
+                logs["gamma"] = torch.exp(self.log_gamma)
+
             self.log_dict(logs, on_epoch=True, on_step=False, sync_dist=True)
         return loss
 
@@ -402,13 +415,13 @@ class ModularVAE(L.LightningModule):
             return optim
         STEPS_PER_EPOCH = int(
             np.ceil(
-                (self.trainer.datamodule.count // 4)
+                (self.trainer.datamodule.count // self.trainer.num_devices)
                 / self.trainer.datamodule.batch_size
             )
         )
         WARMUP_PERIOD = 10
-        lr_sched = {
-            "one-cycle": {
+        if self.scheduler == "one-cycle":
+            lr_sched = {
                 "scheduler": torch.optim.lr_scheduler.OneCycleLR(
                     optim,
                     [spec["lr"] for spec in optim_params],
@@ -419,8 +432,9 @@ class ModularVAE(L.LightningModule):
                     pct_start=self.one_cycle_warmup,
                 ),
                 "interval": "step",
-            },
-            "cosine": torch.optim.lr_scheduler.SequentialLR(
+            }
+        elif self.scheduler == "cosine":
+            lr_sched = torch.optim.lr_scheduler.SequentialLR(
                 optimizer=optim,
                 schedulers=[
                     torch.optim.lr_scheduler.LambdaLR(
@@ -432,25 +446,26 @@ class ModularVAE(L.LightningModule):
                     ),
                 ],
                 milestones=[WARMUP_PERIOD],
-            ),
-            "plateau": {
+            )
+        elif self.scheduler == "plateau":
+            lr_sched = {
                 "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer=optim,
                     mode="min",
                     factor=0.85,
                     patience=5,
+                    verbose=True,
                 ),
                 "monitor": "loss",
                 "interval": "epoch",
-            },
-        }[self.scheduler]
+            }
         return {"optimizer": optim, "lr_scheduler": lr_sched}
 
     def trainable_params(self):
         return [param for param in self.parameters() if param.requires_grad]
 
 
-class ModularNVP(ModularVAE):
+class NVP(VAE):
     def __init__(
         self,
         sample_input,
@@ -476,22 +491,21 @@ class ModularNVP(ModularVAE):
             **kwargs,
         )
 
-        self.build_pseudos()
-        self.empirical_freq = torch.zeros(self.num_pseudos)
+    def _setup(self):
+        super()._setup()
         self.register_buffer(
             "log_n_pseudos",
             torch.log(torch.tensor(self.num_pseudos)),
         )
+        self.build_pseudos()
         if self.train_pseudos:
             self._setup_train_pseudos()
 
-        self.save_hyperparameters()
-
     def project_pseudos(self):
         # Corresponds to MLE estimate of the pseudos on the data manifold
-        self.pseudos = nn.Parameter(self.p_x(self.q_z(self.get_pseudos())[0])).type_as(
-            self.pseudos
-        )
+        mu, logvar, *_ = self.q_z(self.get_pseudos())
+        z = self.reparameterize(mu, logvar)
+        self.pseudos = nn.Parameter(self.p_x(z)).type_as(self.pseudos)
 
     def merge_pseudos(self, indices):
         num_indices = len(indices)
@@ -514,15 +528,10 @@ class ModularNVP(ModularVAE):
             idx, jdx = jdx, idx
         self.num_pseudos -= 1
         pseudos = self.get_pseudos()
+        print(f"Old pseudos shape: {pseudos.shape}")
         mu_p = self.q_z(pseudos)[0]
         mu = torch.mean(mu_p[[idx, jdx]], dim=0, keepdim=True)
-        # plt.imshow(self.p_x(mu_p[idx : idx + 1]).view(28, 28).numpy(force=True))
-        # plt.show()
-        # plt.imshow(self.p_x(mu_p[jdx : jdx + 1]).view(28, 28).numpy(force=True))
-        # plt.show()
         new_pseudo = self.p_x(mu)
-        # plt.imshow(new_pseudo.view(28, 28).numpy(force=True))
-        # plt.show()
         pseudos[idx : idx + 1] = new_pseudo
         pseudos[jdx:-1] = pseudos[jdx + 1 :].clone()
         self.pseudos = nn.Parameter(pseudos[: self.num_pseudos]).type_as(self.pseudos)
@@ -548,9 +557,10 @@ class ModularNVP(ModularVAE):
         self.pseudos = nn.Parameter(initial_val, requires_grad=self.freeze_pseudos == 0)
 
     def gmm_likelihood(self, z, mean, logvar):
-        z = z.unsqueeze(2)  # Pseudos dim
-        mean = mean.unsqueeze(1)  # batch-size
-        logvar = logvar.unsqueeze(1)  # batch-size
+        sample_axis_offset = 0 if z.ndim == 3 else 1
+        z = z.unsqueeze(2 - sample_axis_offset)  # Pseudos dim
+        mean = mean.unsqueeze(1 - sample_axis_offset)  # batch-size
+        logvar = logvar.unsqueeze(1 - sample_axis_offset)  # batch-size
 
         reduced_log_likelihood = log_normal_diag(
             z, mean, logvar, reduction="sum", dim=-1
@@ -573,7 +583,25 @@ class ModularNVP(ModularVAE):
             self.gmm_likelihood(z, mu_p.unsqueeze(0), logvar_p.unsqueeze(0))
         )
 
-    # Reconstruction + KL divergence losses summed over all elements and batch
+    def kl_divergence(self, mu, logvar, z, *args, **kwargs):
+        if self.sample_size > 1:
+            idle = torch.randn((self.sample_size - 1, *z.shape)).type_as(
+                z
+            )  # (sample_size, batch-size, lsdim)
+            stochastic_samples = (
+                mu.unsqueeze(0) + torch.exp(logvar.unsqueeze(0) / 2) * idle
+            )
+            stochastic_samples = torch.concat(
+                [z.unsqueeze(0), stochastic_samples], dim=0
+            )
+        else:
+            stochastic_samples = z.unsqueeze(0)
+        log_p_z = self.log_p_z(stochastic_samples)
+        log_q_z = self.posterior_likelihood(
+            stochastic_samples, mu.unsqueeze(0), logvar.unsqueeze(0)
+        )
+        return log_q_z - log_p_z
+
     def loss_function(
         self,
         x,
@@ -595,24 +623,7 @@ class ModularNVP(ModularVAE):
         if labels is not None:
             metric_loss = self.metric_loss(z, labels)
 
-        # KL
-        if self.sample_size > 1:
-            idle = torch.randn((self.sample_size - 1, *z.shape)).type_as(
-                z
-            )  # (sample_size, batch-size, lsdim)
-            stochastic_samples = (
-                mu.unsqueeze(0) + torch.exp(logvar.unsqueeze(0) / 2) * idle
-            )
-            stochastic_samples = torch.concat(
-                [z.unsqueeze(0), stochastic_samples], dim=0
-            )
-        else:
-            stochastic_samples = z.unsqueeze(0)
-        log_p_z = self.log_p_z(stochastic_samples)
-        log_q_z = self.posterior_likelihood(
-            stochastic_samples, mu.unsqueeze(0), logvar.unsqueeze(0)
-        )
-        kl_loss = log_q_z - log_p_z
+        kl_loss = self.kl_divergence(mu, logvar, z)
 
         if reduction == "mean":
             recon_loss /= x.size(0)
@@ -728,7 +739,7 @@ class ModularNVP(ModularVAE):
                 mu_p=mu_p,
                 logvar_p=logvar_p,
             )
-        if self.train_pseudos:
+        if self.eta > 0:
             grid_len = int(np.ceil(np.sqrt(self.num_pseudos)))
             fig, axes = plt.subplots(grid_len, grid_len)
             fig.set_size_inches(8, 8)
@@ -753,65 +764,50 @@ class ModularNVP(ModularVAE):
     def _make_optim_params(self):
         pseudo_lr = self.lr if self.pseudo_lr is None else self.pseudo_lr
         optim_params = [
-            {"params": self.pseudos, "lr": pseudo_lr},
+            {"params": [self.pseudos], "lr": pseudo_lr},
             {
                 "params": [
-                    *self.mean.parameters(),
-                    *self.logvar.parameters(),
-                    self.log_gamma,
+                    *self.encoder.parameters(),
                 ],
                 "lr": self.lr,
             },
         ]
         if not self.train_pseudos:
-            optim_params.append(
-                {
-                    "params": [*self.encoder.parameters(), *self.decoder.parameters()],
-                    "lr": self.lr,
-                }
+            optim_params[1]["params"].extend(
+                [
+                    *self.mean.parameters(),
+                    *self.logvar.parameters(),
+                    *self.decoder.parameters(),
+                    self.log_gamma,
+                ]
             )
 
         return optim_params
 
 
-class ModularNVPW(ModularNVP):
+class NVPW(NVP):
     def __init__(
         self,
         sample_input,
-        omega=1,
+        omega=0,
         **kwargs,
     ):
         self.omega = omega
+        print(f"DEBUG *** Omega: {omega}")
         super().__init__(
             sample_input=sample_input,
             **kwargs,
         )
 
-    def _make_optim_params(self):
-        pseudo_lr = self.lr if self.pseudo_lr is None else self.pseudo_lr
-        optim_params = [
-            {
-                "params": [self.pseudos],
-                "lr": pseudo_lr,
-            },
-            {
-                "params": [*self.encoder.parameters(), *self.w_evidence.parameters()],
-                "lr": self.lr,
-            },
-        ]
-        if not self.train_pseudos:
-            optim_params.append(
-                {
-                    "params": [
-                        *self.mean.parameters(),
-                        *self.logvar.parameters(),
-                        *self.decoder.parameters(),
-                        self.log_gamma,
-                    ],
-                    "lr": self.lr,
-                }
-            )
+    def _setup(self):
+        super()._setup()
+        self.register_buffer("zero", torch.tensor(0.0))
 
+    def _make_optim_params(self):
+        optim_params = super()._make_optim_params()
+        optim_params[1]["params"].extend(
+            [*self.w_evidence.parameters()],
+        )
         return optim_params
 
     def _merge_pseudos_pair(self, idx, jdx):
@@ -858,6 +854,7 @@ class ModularNVPW(ModularNVP):
 
     def q_z(self, x):
         x = self.encoder(x)
+        x = F.selu(x)
         x = self.batch_norm(x)
         z_q_mean = self.mean(x)
         z_q_logvar = self.logvar(x)
@@ -907,7 +904,7 @@ class ModularNVPW(ModularNVP):
         pseudo_recon_loss, pseudo_kl_loss, _ = self.loss_function(
             x=pseudos,
             x_hat=recon_pseudos,
-            log_w=self.pseudos_prior_log_w,
+            log_w=pseudo_log_w,
             mu=mu_p,
             logvar=logvar_p,
             z=z_p,
@@ -921,12 +918,17 @@ class ModularNVPW(ModularNVP):
         sample_entropy = -torch.sum(torch.exp(aggregate_log_w) * aggregate_log_w)
         entropy_loss = sample_entropy - batch_entropy
         variance_loss = torch.sum(torch.square(torch.sum(logvar_p, dim=-1)))
+        eccentricity_loss = (
+            self.general_kl(self.zero, logvar_p, self.zero, self.zero)
+            if self.current_epoch > 10
+            else self.zero
+        )
         loss = (
-            (1 - self.eta) * (recon_loss + self.beta * kl_loss)
-            + self.eta * (pseudo_recon_loss - self.beta * pseudo_kl_loss)
+            (1 - self.eta) * (recon_loss + kl_loss)
+            + self.eta * (pseudo_recon_loss + self.beta * pseudo_kl_loss)
             + self.delta * metric_loss
             + self.alpha * entropy_loss
-            + self.omega * variance_loss
+            + self.omega * eccentricity_loss
         )
         if batch_idx % 10 == 0:
             logs = {
@@ -944,11 +946,32 @@ class ModularNVPW(ModularNVP):
                 "sample_entropy": sample_entropy,
                 "entropy_loss": entropy_loss,
                 "variance_loss": variance_loss,
+                "eccentricity_loss": eccentricity_loss,
             }
             if hasattr(self, "log_gamma"):
                 logs["gamma"] = torch.exp(self.log_gamma)
             self.log_dict(logs, on_epoch=True, on_step=False, sync_dist=True)
         return loss
+
+    def kl_divergence(self, mu, logvar, z, log_w, *args, **kwargs):
+        # KL
+        if self.sample_size > 1:
+            idle = torch.randn((self.sample_size - 1, *z.shape)).type_as(
+                z
+            )  # (sample_size, batch-size, lsdim)
+            stochastic_samples = (
+                mu.unsqueeze(0) + torch.exp(logvar.unsqueeze(0) / 2) * idle
+            )
+            stochastic_samples = torch.concat(
+                [z.unsqueeze(0), stochastic_samples], dim=0
+            )
+        else:
+            stochastic_samples = z.unsqueeze(0)
+        log_p_z = self.log_p_z(stochastic_samples, log_w)
+        log_q_z = self.posterior_likelihood(
+            stochastic_samples, mu.unsqueeze(0), logvar.unsqueeze(0)
+        )
+        return log_q_z - log_p_z
 
     def loss_function(
         self,
@@ -972,24 +995,7 @@ class ModularNVPW(ModularNVP):
         if labels is not None:
             metric_loss = self.metric_loss(z, labels)
 
-        # KL
-        if self.sample_size > 1:
-            idle = torch.randn((self.sample_size - 1, *z.shape)).type_as(
-                z
-            )  # (sample_size, batch-size, lsdim)
-            stochastic_samples = (
-                mu.unsqueeze(0) + torch.exp(logvar.unsqueeze(0) / 2) * idle
-            )
-            stochastic_samples = torch.concat(
-                [z.unsqueeze(0), stochastic_samples], dim=0
-            )
-        else:
-            stochastic_samples = z.unsqueeze(0)
-        log_p_z = self.log_p_z(stochastic_samples, log_w)
-        log_q_z = self.posterior_likelihood(
-            stochastic_samples, mu.unsqueeze(0), logvar.unsqueeze(0)
-        )
-        kl_loss = log_q_z - log_p_z
+        kl_loss = self.kl_divergence(mu, logvar, z, log_w)
 
         if reduction == "mean":
             recon_loss /= x.size(0)
@@ -1001,7 +1007,163 @@ class ModularNVPW(ModularNVP):
         )
 
 
-class ModularNVPWC(ModularNVPW):
+class NVPWB(NVPW):
+    def __init__(
+        self,
+        sample_input,
+        sbd_depth=None,
+        **kwargs,
+    ):
+        self.sbd_depth = sbd_depth
+        super().__init__(
+            sample_input=sample_input,
+            **kwargs,
+        )
+
+    def build_decoder(self):
+        sbd_depth = self.lsdim if self.sbd_depth is None else self.sbd_depth
+        self.bilinear = nn.Bilinear(self.lsdim, self.num_pseudos, sbd_depth)
+        self.decoder_kwargs["lsdim"] = sbd_depth
+        self.decoder = self.decoder_cls(**self.decoder_kwargs)
+
+    def _merge_pseudos_pair(self, idx, jdx):
+        if idx > jdx:
+            idx, jdx = jdx, idx
+
+        super()._merge_pseudos_pair(idx, jdx)
+
+        bilinear = nn.Bilinear(self.lsdim, self.num_pseudos, self.decoder.lsdim)
+        bilinear.weight = nn.Parameter(
+            self.bilinear.weight[:, :, np.arange(self.num_pseudos + 1) != jdx]
+        ).type_as(self.bilinear.weight)
+        bilinear.to(self.device)
+        self.bilinear = bilinear
+
+    def project_pseudos(self):
+        # Corresponds to MLE estimate of the pseudos on the data manifold
+        mu, logvar, log_w = self.q_z(self.get_pseudos())
+        z = self.reparameterize(mu, logvar)
+        self.pseudos = nn.Parameter(self.p_x(z, log_w)).type_as(self.pseudos)
+
+    def forward(self, x):
+        # z~q(z|x)
+        mu, logvar, log_w = self.q_z(x)
+        z = self.reparameterize(mu, logvar)
+
+        x_hat = self.p_x(z, log_w=log_w)
+        # decode code
+        return x_hat, mu, logvar, z, log_w
+
+    def p_x(self, z, log_w):
+        z = self.bilinear(z, torch.exp(log_w))
+        z = F.leaky_relu(z)
+        x_hat = self.decoder(z)
+        return self.output_activation(x_hat)
+
+    def _make_optim_params(self):
+        optim_params = super()._make_optim_params()
+        optim_params[1]["params"].extend([*self.bilinear.parameters()])
+        return optim_params
+
+
+class LSV(NVPWB):
+    def __init__(
+        self,
+        sample_input,
+        **kwargs,
+    ):
+        super().__init__(
+            sample_input=sample_input,
+            **kwargs,
+        )
+
+    def p_x(self, z, log_w=None):
+        mu_p, logvar_p, _ = self.q_z(self.get_pseudos())
+
+        z = z.unsqueeze(1)  # Pseudos dim
+        mu_p = mu_p.unsqueeze(0)  # batch-size
+        logvar_p = logvar_p.unsqueeze(0)  # batch-size
+
+        log_likelihood = log_normal_diag(z, mu_p, logvar_p, reduction="sum", dim=-1)
+        z = self.bilinear(z.squeeze(1), log_likelihood)
+        z = F.leaky_relu(z)
+        x_hat = self.decoder(z)
+        return self.output_activation(x_hat)
+
+
+class DLSV(NVPWB):
+    def __init__(
+        self,
+        sample_input,
+        **kwargs,
+    ):
+        super().__init__(
+            sample_input=sample_input,
+            **kwargs,
+        )
+
+    def p_x(self, z, log_w=None):
+        mu_p, logvar_p, _ = self.q_z(self.get_pseudos())
+
+        z = z.unsqueeze(1)  # Pseudos dim
+        mu_p = mu_p.unsqueeze(0)  # batch-size
+        logvar_p = logvar_p.unsqueeze(0)  # batch-size
+
+        log_likelihood = log_normal_diag(z, mu_p, logvar_p, reduction="sum", dim=-1)
+        logits_membership = torch.exp(log_likelihood)
+        membership = torch.distributions.OneHotCategorical(
+            logits=logits_membership
+        ).sample()
+        z = self.bilinear(z.squeeze(1), membership)
+        z = F.selu(z)
+        x_hat = self.decoder(z)
+        return self.output_activation(x_hat)
+
+    def log_p_z(self, z, log_w):
+        # Generate posterios for pseudos to serve as components for the prior
+        mu_p, logvar_p, _ = self.q_z(self.get_pseudos())  # C x M
+        log_likelihood = log_normal_diag(
+            z.unsqueeze(2),
+            mu_p.unsqueeze(0).unsqueeze(0),
+            logvar_p.unsqueeze(0).unsqueeze(0),
+            reduction="sum",
+            dim=-1,
+        )
+        logits_membership = torch.exp(log_likelihood)
+        membership = torch.distributions.Categorical(logits=logits_membership).sample()
+        return torch.mean(
+            torch.take_along_dim(log_likelihood, membership.unsqueeze(-1), dim=-1)
+        )
+
+
+class FDLSV(DLSV):
+    def __init__(
+        self,
+        sample_input,
+        **kwargs,
+    ):
+        super().__init__(
+            sample_input=sample_input,
+            **kwargs,
+        )
+
+    def kl_divergence(self, mu, logvar, z, log_w, *args, **kwargs):
+        mu_p, logvar_p, *_ = self.q_z(self.get_pseudos())
+        log_likelihood = log_normal_diag(
+            z.unsqueeze(1),
+            mu_p.unsqueeze(0),
+            logvar_p.unsqueeze(0),
+            reduction="sum",
+            dim=-1,
+        )
+        logits_membership = torch.exp(log_likelihood)
+        membership = torch.distributions.Categorical(logits=logits_membership).sample()
+        mu_p = mu[membership]
+        logvar_p = logvar[membership]
+        return torch.mean(self.general_kl(mu, logvar, mu_p, logvar_p, dim=-1))
+
+
+class NVPWC(NVPW):
     def __init__(
         self,
         sample_input,
@@ -1013,7 +1175,7 @@ class ModularNVPWC(ModularNVPW):
         )
 
     def build_pseudos(self):
-        ModularNVP.build_pseudos(self)
+        NVP.build_pseudos(self)
         self.w_evidence = nn.Parameter(torch.zeros(self.num_pseudos))
 
     def get_log_w(self, x):
@@ -1042,3 +1204,157 @@ class ModularNVPWC(ModularNVPW):
             )
 
         return optim_params
+
+
+class DenseModule(L.LightningModule):
+    def __init__(self, layer_spec, **kwargs):
+        super().__init__(**kwargs)
+        self.layer_spec = layer_spec
+        cumualative_intermediates = np.cumsum(layer_spec[:-1])
+        self.cumulative_layer_spec = np.concatenate(
+            [cumualative_intermediates, [layer_spec[-1]]]
+        )
+        self.layers = nn.ModuleList(
+            [
+                nn.Linear(self.cumulative_layer_spec[i], self.layer_spec[i + 1])
+                for i in range(len(layer_spec) - 1)
+            ]
+        )
+        # self.batch_norms = nn.ModuleList(
+        #     [
+        #         nn.LayerNorm(self.cumulative_layer_spec[i])
+        #         for i in range(len(layer_spec) - 1)
+        #     ]
+        # )
+        self.FC_shape = self.cumulative_layer_spec[-1]
+
+    def forward(self, x):
+        for layer in self.layers:
+            # t = batch_norm(x)
+            t = layer(x)
+
+            if layer == self.layers[-1]:
+                return t
+
+            t = F.selu(t)
+            x = torch.concat((x, t), dim=-1)
+
+
+class LVAE(VAE):
+    """
+    A simple VAE with a linear decoder and encoder meant to be used as the
+    second stage for the two-stage VAE paradigm. This VAE learns an aproximately
+    isomorphic mapping on the data manifold to map from a standard gaussian
+    distribution, and the empirical data distribution.
+    """
+
+    def __init__(
+        self,
+        sample_input,
+        encoder_cls=DenseModule,
+        decoder_cls=DenseModule,
+        **kwargs,
+    ):
+        self.sample_input = sample_input
+        self.encoder_cls = encoder_cls
+        self.decoder_cls = decoder_cls
+        self.x = []
+        self.x_hat = []
+        self.targets = []
+        super().__init__(
+            sample_input, encoder_cls=encoder_cls, decoder_cls=decoder_cls, **kwargs
+        )
+
+    def _setup(self):
+        self.encoder_kwargs["layer_spec"].insert(0, self.lsdim)
+        self.decoder_kwargs["layer_spec"].insert(0, self.lsdim)
+        self.decoder_kwargs["layer_spec"].append(self.lsdim)
+        super()._setup()
+
+    def output_activation(self, x):
+        return x
+
+    def on_train_epoch_end(self):
+        if self.global_rank != 0:
+            return
+
+        tb = self.trainer.logger.experiment
+        self.eval()
+        if self.lsdim == 2:
+            with torch.no_grad():
+                generate_embedding(
+                    self.trainer.train_dataloader,
+                    lambda x: self(x)[3],
+                    self.device,
+                    tb,
+                    self.current_epoch,
+                    mu_p=None,
+                    logvar_p=None,
+                )
+            x_hats = torch.concatenate(self.x_hat).numpy(force=True)
+            xs = torch.concatenate(self.x).numpy(force=True)
+            targets = torch.concatenate(self.targets).numpy(force=True)
+            self.x = []
+            self.x_hat = []
+            self.targets = []
+
+            fig, axes = plt.subplots(1, 1, figsize=(20, 20))
+            axes.scatter(
+                x_hats[:, 0],
+                x_hats[:, 1],
+                c=targets,
+                s=45 / np.sqrt(len(targets)),
+                cmap="tab10",
+            )
+            tb.add_image(
+                "Mapped Embedding",
+                plot_to_image(fig),
+                self.current_epoch,
+            )
+            if self.current_epoch == 0:
+                fig, axes = plt.subplots(1, 1, figsize=(20, 20))
+                axes.scatter(
+                    xs[:, 0],
+                    xs[:, 1],
+                    c=targets,
+                    s=45 / np.sqrt(len(targets)),
+                    cmap="tab10",
+                )
+                tb.add_image(
+                    "Original Embedding",
+                    plot_to_image(fig),
+                    self.current_epoch,
+                )
+        self.train()
+
+    def training_step(self, batch, batch_idx):
+        x, labels = batch
+        x_hat, mu_z, logvar, z = self(x)
+        recon_loss, kl_loss, metric_loss = self.loss_function(
+            x=x,
+            x_hat=x_hat,
+            mu=mu_z,
+            logvar=logvar,
+            z=z,
+            labels=labels if self.use_labels else None,
+        )
+        if self.lsdim == 2:
+            self.x.append(x.detach())
+            self.x_hat.append(x_hat.detach())
+            self.targets.append(labels)
+
+        loss = recon_loss + self.beta * kl_loss + self.delta * metric_loss
+        if batch_idx % 10 == 0:
+            logs = {
+                "kl_loss": kl_loss,
+                "recon_loss": recon_loss,
+                "loss": loss,
+                "metric_loss": metric_loss,
+                "learning rate": self.trainer.optimizers[0].param_groups[0]["lr"],
+                "raw_MSE": F.mse_loss(x_hat, x, reduction="mean"),
+            }
+            if hasattr(self, "log_gamma"):
+                logs["gamma"] = torch.exp(self.log_gamma)
+
+            self.log_dict(logs, on_epoch=True, on_step=False, sync_dist=True)
+        return loss

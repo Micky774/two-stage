@@ -7,6 +7,8 @@ import torch
 import numpy as np
 import os
 from tqdm import tqdm
+from .driver import _load
+import matplotlib.pyplot as plt
 
 parser = ArgumentParser()
 parser.add_argument("--log-dir", type=str, default="logs")
@@ -21,16 +23,14 @@ EMBEDDINGS_DIR = "embeddings" if args.out_dir == "" else args.out_dir
 
 if __name__ == "__main__":
     seed_everything(42, workers=True)
-    load_path = os.path.join(args.log_dir, args.model, args.load, "checkpoints")
-    chkpt_path = None
+    load_path = os.path.join(args.log_dir, args.model, args.load)
     if os.path.exists(load_path):
-        chkpt_path = os.path.join(load_path, os.listdir(load_path)[0])
-        print(f"Loading from {chkpt_path}")
         model = (
-            get_model_cls(args.model)
-            .load_from_checkpoint(
-                chkpt_path, sample_input=torch.zeros((1, 1, 28, 28)), lsdim=16
-            )
+            _load(
+                get_model_cls(args.model),
+                load_path=load_path,
+                cls_kwargs=dict(num_pseudos=20),
+            )[0]
             .eval()
             .to("cuda")
         )
@@ -42,11 +42,12 @@ if __name__ == "__main__":
     train_data = data.train_dataloader()
     embeddings = []
     labels = []
-    for batch in tqdm(train_data):
-        x, y = batch
-        z = model(x.to(model.device))[-1]
-        embeddings.append(z.cpu().numpy())
-        labels.append(y.cpu().numpy())
+    with torch.no_grad():
+        for batch in tqdm(train_data):
+            x, y = batch
+            z = model(x.to(model.device))[3]
+            embeddings.append(z.cpu().numpy())
+            labels.append(y.cpu().numpy())
 
     print("Concatenating embeddings")
     embeddings = np.concatenate(embeddings)
@@ -58,4 +59,12 @@ if __name__ == "__main__":
         os.path.join(save_dir, "embeddings.npy"),
         embeddings,
     )
+    print(f"Saving labels to {save_dir}")
     np.save(os.path.join(save_dir, "labels.npy"), labels)
+    plt.scatter(embeddings[:, 0], embeddings[:, 1], c=labels, cmap="tab10")
+    plt.savefig("embedding.png")
+    print("Done.")
+    del model
+    del data
+    del train_data
+    print("Cleaned up.")
