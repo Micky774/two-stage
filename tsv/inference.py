@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 from .natvamp import get_model_cls
-from .data import MNISTDataModule, FMNISTDataModule
+from .data import get_data_module
 import os
 from lightning.pytorch import seed_everything
 import torch
@@ -16,6 +16,8 @@ parser.add_argument("--load", type=str, default="")
 parser.add_argument("--model", type=str, default="")
 parser.add_argument("--batch-size", type=int, default=200)
 parser.add_argument("--out-dir", type=str, default="")
+parser.add_argument("--num-pseudos", type=int, default=10)
+parser.add_argument("--dataset", type=str, default="fmnist")
 
 args = parser.parse_args()
 
@@ -29,7 +31,7 @@ if __name__ == "__main__":
             _load(
                 get_model_cls(args.model),
                 load_path=load_path,
-                cls_kwargs=dict(num_pseudos=20),
+                cls_kwargs=dict(num_pseudos=args.num_pseudos),
             )[0]
             .eval()
             .to("cuda")
@@ -37,15 +39,20 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Checkpoint at {load_path} not found.")
 
-    data = FMNISTDataModule(num_workers=31, batch_size=args.batch_size, shuffle=False)
-    data.setup("fit")
-    train_data = data.train_dataloader()
+    datamodule = get_data_module(
+        args.dataset,
+        batch_size=args.batch_size,
+        num_workers=31,
+        shuffle=False,
+    )
+    datamodule.setup("fit")
+    train_data = datamodule.train_dataloader()
     embeddings = []
     labels = []
     with torch.no_grad():
         for batch in tqdm(train_data):
             x, y = batch
-            z = model(x.to(model.device))[3]
+            z = model(x.to(model.device))[1]
             embeddings.append(z.cpu().numpy())
             labels.append(y.cpu().numpy())
 
@@ -65,6 +72,6 @@ if __name__ == "__main__":
     plt.savefig("embedding.png")
     print("Done.")
     del model
-    del data
+    del datamodule
     del train_data
     print("Cleaned up.")

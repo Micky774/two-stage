@@ -359,7 +359,6 @@ def generate_embedding(
         z = transform(z)
         embeddings.append(z.detach().cpu().numpy())
         targets.append(y.detach().cpu().numpy())
-
     embeddings = np.concatenate(embeddings)
     targets = np.concatenate(targets)
     fig, axes = plt.subplots(1, 1, figsize=(20, 20))

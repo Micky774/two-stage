@@ -1,9 +1,10 @@
 from argparse import ArgumentParser
 import torch
 import lightning as L
-from torchinfo import summary
+
+# from torchinfo import summary
 from lightning.pytorch.loggers import TensorBoardLogger
-from .data import MNISTDataModule, FMNISTDataModule, CIFAR10DataModule, LatentDataModule
+from .data import get_data_module
 from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import (
     StochasticWeightAveraging,
@@ -78,6 +79,8 @@ parser.add_argument("--disable-gamma", action="store_true")
 parser.add_argument("--omega", type=float, default=0)
 parser.add_argument("--sbd-depth", type=int, default=None)
 parser.add_argument("--embedding-path", type=str, default=None)
+parser.add_argument("--init-pseudos", action="store_true")
+parser.add_argument("--patience", type=int, default=10)
 parser.add_argument(
     "--grad-clip-alg", type=str, default="norm", choices=["norm", "value"]
 )
@@ -106,6 +109,9 @@ SAMPLE_INPUT = {
     "fmnist": torch.zeros((args.batch_size, 1, 28, 28)),
     "cifar10": torch.zeros((args.batch_size, 3, 32, 32)),
     "latent": torch.zeros((args.batch_size, args.latent_dim)),
+    "chest-mnist": torch.zeros((args.batch_size, 1, 28, 28)),
+    "oct-mnist": torch.zeros((args.batch_size, 1, 28, 28)),
+    "blood-mnist": torch.zeros((args.batch_size, 3, 28, 28)),
 }[args.dataset]
 
 # if args.model == "resnet-50":
@@ -137,12 +143,14 @@ class BetaScheduler(Callback):
         self.beta = pl_module.beta
 
     def on_train_epoch_start(self, trainer, pl_module):
-        epoch = pl_module.current_epoch % self.T
+        epoch = pl_module.current_epoch
         warmup_period = self.T * self.R
         if epoch < warmup_period:
-            pl_module.beta = self.beta * (epoch / warmup_period)
-        else:
-            pl_module.beta = self.beta
+            pl_module.beta = 0
+        elif epoch < self.T:
+            pl_module.beta = self.beta * (
+                (epoch - warmup_period) / (self.T - warmup_period)
+            )
 
 
 def __make_cls_kwargs():
@@ -161,10 +169,11 @@ def __make_cls_kwargs():
         weight_decay=args.weight_decay,
         one_cycle_warmup=args.one_cycle_warmup,
         enable_gamma=not args.disable_gamma,
+        patience=args.patience,
     )
     if args.decoder == "dense":
         decoder_kwargs = dict(
-            layer_spec=[256] * 2,
+            layer_spec=[128] * 5,
         )
     if args.decoder == "sbd":
         decoder_kwargs = dict(
@@ -214,7 +223,7 @@ def __make_cls_kwargs():
         )
     if args.encoder == "dense":
         encoder_kwargs = dict(
-            layer_spec=[256] * 4,
+            layer_spec=[128] * 6,
         )
     cls_kwargs["encoder_kwargs"] = encoder_kwargs
     cls_kwargs["decoder_kwargs"] = decoder_kwargs
@@ -268,7 +277,7 @@ if __name__ == "__main__":
             kaiming_init(model, a=0.1)
 
     log_path = os.path.join(LOGDIR, args.model, args.version)
-    summary(model, input_size=SAMPLE_INPUT.shape)
+    # summary(model, input_size=SAMPLE_INPUT.shape)
     logger = TensorBoardLogger(
         LOGDIR,
         name=args.model,
@@ -279,7 +288,7 @@ if __name__ == "__main__":
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
         devices=args.devices,
-        # accelerator="cpu",
+        accelerator="gpu",
         fast_dev_run=args.fast_dev,
         logger=logger,
         gradient_clip_val=args.grad_clip_val,
@@ -305,34 +314,21 @@ if __name__ == "__main__":
     )
 
     transforms = getattr(model, "transforms", None)
-    datamodule = {
-        "mnist": MNISTDataModule(
-            "MNIST",
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            labels_path=args.labels_path,
-            transforms=transforms,
-        ),
-        "fmnist": FMNISTDataModule(
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            labels_path=args.labels_path,
-            transforms=transforms,
-        ),
-        "cifar10": CIFAR10DataModule(
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            labels_path=args.labels_path,
-            transforms=transforms,
-        ),
-        "latent": LatentDataModule(
-            data_path=args.embedding_path,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            labels_path=args.labels_path,
-            transforms=transforms,
-        ),
-    }[args.dataset]
+    datamodule = get_data_module(
+        args.dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        transforms=transforms,
+        labels_path=args.labels_path,
+        embedding_path=args.embedding_path,
+    )
+    if args.init_pseudos:
+        datamodule.setup("fit")
+        initial_vals = torch.empty((args.num_pseudos, *SAMPLE_INPUT.shape[1:]))
+        dataset = iter(datamodule.train_dataloader().dataset)
+        for i in range(args.num_pseudos):
+            initial_vals[i] = torch.tensor(next(dataset)[0])
+        model.init_pseudos(initial_vals)
     trainer.fit(
         model=model,
         datamodule=datamodule,
